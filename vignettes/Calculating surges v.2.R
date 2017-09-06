@@ -12,7 +12,7 @@
 library(tidyverse)
 library(stringr)
 library(zoo)
-devtools::install_github("EBukin/tradeAnalysis-pack")
+# devtools::install_github("EBukin/tradeAnalysis-pack")
 library(tradeAnalysis)
 
 # Sourcing functions from R folder
@@ -52,19 +52,62 @@ add_labels <- function(x, areas = areasMT, coms = comsMT) {
   # browser()
   x <- 
     join_labels_generic(x, 
-                      mappingTable = rename(areasMT, Code = areacode, Name = areaname), 
+                      mappingTable = rename(areas, Code = areacode, Name = areaname), 
                       oldNames = c("areacode"), 
                       newNames = c("areaname"), 
                       keepCodes = TRUE)
   x <- 
     join_labels_generic(x, 
-                        mappingTable = rename(areasMT, Code = elecode, Name = elename), 
-                        oldNames = c("elecode"), 
-                        newNames = c("elename"), 
+                        mappingTable = select(rename(coms, Code = comcode, Name = comname), Code, Name), 
+                        oldNames = c("comcode"), 
+                        newNames = c("comname"), 
                         keepCodes = TRUE)
   x
 }
 
+# Making years groups for aggregation
+add_year_groups <-
+  function(x,
+           n_group = 10,
+           startYear = NULL) {
+    # browser()
+    allYear <- unique(x$Year)
+    if (!is_null(startYear)) {
+      allYear <- allYear[allYear >= startYear]
+    }
+    YearGrops <-
+      split(allYear, ceiling(seq_along(allYear) / n_group)) %>%
+      map_df(.,
+             function(y) {
+               tibble(YearGrop = str_c(min(y), "/", str_sub(as.character(max(
+                 y
+               )), 3, 4)),
+               Year = y)
+             })
+    x %>%
+      left_join(YearGrops, "Year") %>%
+      mutate(Year = YearGrop) %>%
+      select(-YearGrop)
+  }
+
+# Add region function(
+add_region <-
+  function(data,
+           RegionsType = "Income",
+           mt = system.file("extdata", str_c(mtType, "_regions.csv"), package = "tradeAnalysis"),
+           mtType = "ct") {
+    
+    # Maping table
+    regionsMT <-
+      read.csv(mt, stringsAsFactors = FALSE) %>% 
+      tbl_df() %>% 
+      select(Code, contains(RegionsType, ignore.case = TRUE), -contains("source"))
+    names(regionsMT)[2] <- "Region"
+    
+    data %>% 
+      left_join(regionsMT, by = c("Reporter.Code" = "Code"))
+    
+  }
 
 # Loading data ------------------------------------------------------------
 
@@ -127,6 +170,9 @@ com_list <- c(15, 56, 31, 236, 201, 204, 203, 207, 257, 1213)
 #   8     207 poultry meat      61          Imports
 #   9     257     palm oil    6101 MY imports total
 #   10    1213        sugar    1610    Imports total
+
+# Main regions used in the analysis
+allRegions <- c("LDC", "G33", "SVE", "RAM", "WTO", "newGroup", "oldGroup")
 
 # Cleaning data for analysis ---------------------------------------------
 
@@ -270,61 +316,155 @@ rule_mean_sd <- function(adRange = c(1)) {
               })
 }
 
+# rule_mean_sd(seq(1,3,0.01))
+
 # Establishing rules to apply
 rules <-
-  list(rule_mean_ad(seq(1,3,0.01)), rule_mean_sd(seq(1,3,0.01))) %>%
+  list(rule_mean_ad(seq(1, 3, 0.01))) %>%
   unlist(., FALSE)
 
-# Applying rules to data -----------------------------------------------------------
+# Applying rules to data and summarising it  -------------------------------
 
 # Calculating all rolling statistics
 calcs <-
   filtered_df %>%
   group_by_(.dots = names(filtered_df)[!names(filtered_df) %in% c("Year", "Value")]) %>%
   arrange_( ~ areacode, ~ comcode, ~ elecode, ~ Year) %>% 
-  calc_roll_stats(.) 
+  calc_roll_stats(.) %>% 
+  ungroup()
 
-write_rds(calcs, "output/calcs.rds", compress = 'gz')
+# write_rds(calcs, "output/calcs.rds", compress = 'gz')
 
 # Applying rules to an example
-appliedRules <- 
-  map_df(rules, ~apply_rule(calcs, .x)) 
+aplliedRules <- map_df(rules, ~apply_rule(calcs, .x)) 
 
-write_rds(appliedRules, "output/appliedRules.rds", compress = 'gz')
+# Calculating number of transactions, where there could have happend a surge
+totalTransaction <- 
+  aplliedRules %>% 
+  filter(!is.na(Surge)) %>% 
+  select(areacode, comcode, elecode, Rule, Year) %>% 
+  mutate(transaction = 1,
+         Partner.Code = NA) %>% 
+  rename(Reporter.Code = areacode) 
+  
+# Aggregating total number of surges
+calcsSummary <- 
+  aplliedRules %>% 
+  group_by_(.dots = names(.)[!names(.) %in% c("Value", "rollMean", "rollSE", "Threshold", "Surge")]) %>% 
+  summarise(Surge = sum(Surge, na.rm = TRUE)) %>% 
+  mutate(Partner.Code = NA) %>% 
+  rename(Reporter.Code = areacode) %>% 
+  ungroup()
+
+# Aggregating total number of import surges for a commodity/region for regions
+# Aggregating total number of import surges per country. 
+# Joining this parameters together
+allRegionsData <-
+  map_df(allRegions,
+         function(x) {
+           theRegion = x
+           agg_reporters(
+             calcsSummary,
+             RegionsType = theRegion,
+             valCol = "Surge",
+             mtType = "fs"
+           ) %>%
+             left_join(
+               agg_reporters(
+                 totalTransaction,
+                 RegionsType = theRegion,
+                 valCol = "transaction",
+                 mtType = "fs"
+               ),
+               by = c(
+                 "Reporter.Code",
+                 "comcode",
+                 "elecode",
+                 "Year",
+                 "Rule",
+                 "Partner.Code"
+               )
+             ) %>%
+             filter(!is.na(transaction))
+         }) %>%
+  rename(areacode = Reporter.Code) %>%
+  select(-Partner.Code) %>%
+  filter(!is.na(areacode),
+         areacode %in% allRegions)
+
+# Based on the number of existing transactions, where a surge could potentiall occur.
+
+############################
+############################
+############################
+allRegionsData %>% 
+  group_by(areacode, Rule) %>% 
+  summarise(Surge = sum(Surge, na.rm = TRUE),
+            transaction = sum(transaction, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  mutate(subrule = str_sub(Rule, end = 5),
+         Rule = as.numeric(str_sub(Rule, 6))) %>% 
+  ggplot(aes(Rule, Surge/transaction, group = areacode, fill = areacode, colour = areacode)) +
+  geom_line() +
+  ggtitle(label = "All commodities, different groups") +
+  xlab("Moving averag * ")
+############################
+
+allRegionsData %>% 
+  add_labels() %>% 
+  group_by(areacode, comname, Rule) %>% 
+  summarise(Surge = sum(Surge, na.rm = TRUE),
+            transaction = sum(transaction, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  mutate(Rule = as.numeric(str_sub(Rule, 6))) %>% 
+  ggplot(aes(Rule, Surge/transaction, group = areacode, fill = areacode, colour = areacode)) +
+  geom_line() +
+  facet_wrap(~comname) +
+  ggtitle(label = "By commodities, different groups") +
+  xlab("Moving averag * ")
+
+
+############################
+############################
+############################
+
+
+
+te <-
+  allRegionsData %>% 
+  filter(!is.na(Year)) %>% 
+  # add_year_groups(., 5, 1992) %>% 
+  # group_by_(.dots = names(.)[!names(.) %in% c("Value", "rollMean", "rollSE", "Threshold", "Surge", "transaction")]) %>%
+  # summarise(Surge = sum(Surge, na.rm = TRUE),
+  #           transaction = sum(transaction, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  arrange(Year)
+
+
+
+############################
+############################
+############################
+
+library(ggplot2)
+te %>% 
+add_labels() %>% 
+ggplot( aes(Year, Surge/transaction, group = areacode, fill = areacode, colour = areacode)) +
+  geom_line() +
+  facet_wrap(~comname)
+  
+
+# write_rds(appliedRules, "output/appliedRules.rds", compress = 'gz')
 
 # Data export and visualisation -------------------------------------------
 
-# Making years groups for aggregation
-add_year_groups <-
-  function(x,
-           n_group = 10,
-           startYear = NULL) {
-    # browser()
-    allYear <- unique(x$Year)
-    if (!is_null(startYear)) {
-      allYear <- allYear[allYear >= startYear]
-    }
-    YearGrops <-
-      split(allYear, ceiling(seq_along(allYear) / n_group)) %>%
-      map_df(.,
-             function(y) {
-               tibble(YearGrop = str_c(min(y), "/", str_sub(as.character(max(
-                 y
-               )), 3, 4)),
-               Year = y)
-             })
-    x %>%
-      left_join(YearGrops, "Year") %>%
-      mutate(Year = YearGrop) %>%
-      select(-YearGrop)
-  }
 
 
 # Group Years -------------------------------------------------------------
 
 # Sammarising year grous
 calcsSummary <-
-  calcs %>% 
+  appliedRules %>% 
   add_year_groups(., 5, 1992) %>% 
   group_by_(.dots = names(.)[!names(.) %in% c("Value", "rollMean", "rollSE", "Threshold", "Surge")]) %>% 
   summarise(Surge = sum(Surge, na.rm = TRUE)) %>% 
